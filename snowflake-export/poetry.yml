@@ -1,0 +1,125 @@
+.check-symlinks:
+  before_script:
+    # Default behavior if symlinks are found is to report it and exit.
+    # If variable: POETRY_REPLACE_SYMLINKS is set to true, all symlinks will be replaced with actual files.
+    - symlinks_count=$(find . -type l | wc -l)
+    - echo "Found $symlinks_count symlinks."
+    - |
+      if [ "$symlinks_count" != 0 ]; then 
+        if [ "$POETRY_REPLACE_SYMLINKS" = false ]; then 
+          echo " "
+          echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+          echo "! Symlinks Found! Poetry doesn't follow symlinks for sdist.                                !"
+          echo "! (https://github.com/python-poetry/poetry/issues/1998)                                    !"
+          echo "! You can permanently replace those symlinks with actual files in your project.            !"
+          echo "! Or if you want to replace them only at build time and keep the symlinks in your project, !"
+          echo "! set variable 'POETRY_REPLACE_SYMLINKS' to 'true' in your project pipeline file,          !"
+          echo "! then run a new pipeline.                                                                 !"
+          echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+          echo " "
+
+          ETS_STATUS="symlinks_skipped"
+        else
+          echo " "
+          echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+          echo "! Symlinks Found! They will be replaced by the actual files prior to Poetry build  !"
+          echo "! due to Poetry not be able to handle symlinks for sdist issue.                    !"
+          echo "!    https://github.com/python-poetry/poetry/issues/1998                           !"
+          echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+          echo " "
+          $(find . -type l -exec sh -c 'target=$(readlink -f "$0"); rm "$0" && cp "$target" "$0"' {} \;)
+
+          ETS_STATUS="symlinks_replaced"
+        fi
+
+        # Signal ETS that symlinks are present in project.
+        # setup jq for building ETS event
+        apt-get update && apt-get install -y --no-install-recommends jq
+        EVENT_ID="$CI_PROJECT_NAME-$CI_PIPELINE_ID-$CI_JOB_NAME-$CI_JOB_ID"
+        echo "ETS event id=$EVENT_ID"
+        DESCRIPTION="Symlinks present in project $CI_PROJECT_NAME."
+
+        $(jq -n --arg project_name "$CI_PROJECT_NAME" \
+              --arg description "$DESCRIPTION" \
+              --arg pipeline_url "$CI_PIPELINE_URL" \
+              --arg ets_status "$ETS_STATUS" \
+              --arg event_id "$EVENT_ID" \
+              '{event:{
+                  tags:{
+                    source:["poetry_build"],
+                    type:["poetry_symlinks"],
+                    service:[$project_name],
+                    status:[$ets_status],
+                  },
+                  description:$description,
+                  detail_urls:{pipeline:$pipeline_url},
+                  id:$event_id
+              }}' > ets_param.json)
+        echo -e "Calling ETS with these parameters:\n\n$(cat ets_param.json)"
+        
+        # curl returns exit code 0 even if parameters to ETS are incorrect.
+        # So, 'grep' the ID to confirm that ETS successfully processed the call 
+        ets_result=$(curl --retry 3 --max-time 900 -qsX PUT -H 'Content-Type: application/json' -d @ets_param.json http://events.in.zillow.net/api/v1/event/)
+        echo $ets_result
+      fi
+
+.bootstrap-poetry:
+  before_script:
+    - pip install poetry${POETRY_VERSION_SPECIFIER}
+    - |
+      if [[ $AUTO_VERSION == "false" ]]; then
+        if [[ $CI_COMMIT_TAG ]]; then
+          SEMVER=$CI_COMMIT_TAG
+        else
+          SEMVER=0.${CI_PIPELINE_IID}
+        fi
+      elif [[ $AUTO_VERSION == "true" ]]; then
+        SEMVER=${AUTO_MAJOR_VERSION}.${AUTO_MINOR_VERSION}.${CI_PIPELINE_IID}
+        if [[ $CI_COMMIT_REF_NAME != $CI_DEFAULT_BRANCH ]]; then
+          SEMVER+="${CI_COMMIT_REF_SLUG}"
+        fi
+      else
+        echo 'AUTO_VERSION must be "true" or "false".' > /dev/stderr
+        exit 1
+      fi
+    - poetry version $SEMVER
+
+.bootstrap-symlinks-check-poetry:
+  before_script:
+    - !reference [.bootstrap-poetry, before_script]
+    - !reference [.check-symlinks, before_script]
+
+.build-poetry:
+  extends: .bootstrap-symlinks-check-poetry
+  script:
+    - poetry install --no-interaction --no-ansi
+    - poetry run pytest
+    - poetry build
+  artifacts:
+    paths:
+      - dist
+
+.build-coverage:
+  extends: .bootstrap-poetry
+  coverage: '/^TOTAL.+?(\d+\%)$/'
+  script:
+    - poetry install --no-interaction --no-ansi
+    - |
+      if [[ $TEST_COVERAGE_MODULE ]]; then
+        MODULE=$TEST_COVERAGE_MODULE
+      else
+        MODULE=$(poetry run python -c "import json; f = open('.cookiecutter.json'); print(json.loads(f.read())['module'])")
+      fi
+    - poetry run pytest --cov=$MODULE/ tests/
+    - poetry run coverage xml
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+.publish-poetry:
+  extends: .bootstrap-poetry
+  script:
+    - poetry config repositories.artifactory $PYPI_REPOSITORY
+    - poetry publish -r artifactory --username $PYPI_USERNAME --password $PYPI_PASSWORD
